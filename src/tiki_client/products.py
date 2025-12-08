@@ -16,7 +16,10 @@ async def fetch_product(product_id: int) -> Dict[str, Any]:
 def to_product_row(data: Dict[str, Any]) -> Dict[str, Any]:
     brand = data.get("brand") or {}
     current_seller = data.get("current_seller") or {}
-    categories = data.get("categories") or {}
+    # NOTE: We intentionally do not derive category_id from the product
+    # detail payload because products may belong to multiple categories.
+    # The authoritative category_id comes from the listing crawl, so we
+    # leave category_id unchanged during enrichment.
 
     return {
         "id": data.get("id"),
@@ -25,7 +28,6 @@ def to_product_row(data: Dict[str, Any]) -> Dict[str, Any]:
         "name": data.get("name"),
         "brand": brand.get("name"),
         "brand_id": brand.get("id"),
-        "category_id": categories.get("id"),
         "price": data.get("price"),
         "list_price": data.get("list_price"),
         "original_price": data.get("original_price"),

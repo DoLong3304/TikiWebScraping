@@ -47,7 +47,7 @@ create table if not exists public.product (
     name             text not null,
     brand            text,
     brand_id         bigint,
-    category_id      bigint references public.category(id),
+    category_id      bigint not null references public.category(id) on delete restrict,
     price            numeric(12,2),
     list_price       numeric(12,2),
     original_price   numeric(12,2),
@@ -73,11 +73,8 @@ create index if not exists idx_product_category_id on public.product(category_id
 create index if not exists idx_product_seller_id on public.product(seller_id);
 create index if not exists idx_product_brand on public.product(brand);
 
-create table if not exists public.product_category (
-    product_id  bigint references public.product(id) on delete cascade,
-    category_id bigint references public.category(id) on delete cascade,
-    primary key (product_id, category_id)
-);
+-- Redundant when using product.category_id; keep schema lean
+drop table if exists public.product_category;
 
 create table if not exists public.review (
     id             bigint primary key,

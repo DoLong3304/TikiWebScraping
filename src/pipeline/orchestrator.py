@@ -1,13 +1,10 @@
+import argparse
 import asyncio
 import logging
-from typing import Iterable, List
+from dataclasses import dataclass, field
+from typing import Iterable, List, Literal, Optional
 
-from src.config import (
-    DEFAULT_PARENT_CATEGORY_ID,
-    MAX_PAGES_PER_CATEGORY,
-    MAX_REVIEW_PAGES_PER_PRODUCT,
-    RUN_MODE,
-)
+from src.config import DEFAULT_PARENT_CATEGORY_ID, MAX_PAGES_PER_CATEGORY, MAX_REVIEW_PAGES_PER_PRODUCT
 from src.db.supabase_client import (
     get_supabase_client,
     upsert_categories,
@@ -29,24 +26,107 @@ from src.tiki_client.sellers import fetch_seller, to_seller_row_from_widget
 logger = logging.getLogger("tiki_pipeline")
 
 
+@dataclass
+class RunPlan:
+    """Declarative run plan shared by CLI and GUI.
+
+    mode="scrape" allows creating new records from Tiki. mode="update" only
+    refreshes existing records and will not insert brand new products/sellers.
+    """
+
+    categories_listings: bool = True
+    products: bool = True
+    reviews: bool = True
+    sellers: bool = True
+    mode: Literal["scrape", "update"] = "scrape"
+    product_ids_override: Optional[List[int]] = None
+    start_index_reviews: int = 0
+    parent_category_id: int = DEFAULT_PARENT_CATEGORY_ID
+
+
+@dataclass
+class RunResult:
+    errors: dict[str, list[str]] = field(default_factory=dict)
+    failed_review_ids: list[int] = field(default_factory=list)
+    failed_product_ids: list[int] = field(default_factory=list)
+    product_ids_processed: list[int] = field(default_factory=list)
+
+
+def _existing_product_ids(client: any) -> List[int]:
+    res = client.table("product").select("id").execute()
+    return [row["id"] for row in (res.data or [])]
+
+
+def _validate_plan(plan: RunPlan) -> None:
+    if plan.mode not in ("scrape", "update"):
+        raise ValueError("mode must be 'scrape' or 'update'")
+    if not (plan.categories_listings or plan.products or plan.reviews or plan.sellers):
+        raise ValueError("Select at least one stage to run")
+
+    if plan.parent_category_id <= 0:
+        raise ValueError("parent_category_id must be a positive category id")
+
+    requires_source = plan.mode == "scrape" and (plan.products or plan.reviews or plan.sellers)
+    if requires_source and not (plan.categories_listings or plan.product_ids_override):
+        raise ValueError(
+            "Scrape mode needs 'categories_listings' selected or explicit product_ids_override to seed new items"
+        )
+
+    if plan.start_index_reviews < 0:
+        raise ValueError("start_index_reviews cannot be negative")
+
+
 async def sync_categories(parent_id: int = DEFAULT_PARENT_CATEGORY_ID) -> List[int]:
     logger.info("[1/4] Fetching categories for parent_id=%s", parent_id)
-    raw = await fetch_categories(parent_id)
+    try:
+        raw = await fetch_categories(parent_id)
+    except Exception as exc:  # pragma: no cover - network failure handling
+        logger.error("[1/4] Failed to fetch categories for parent_id=%s: %s", parent_id, exc)
+        return []
+
     rows = to_category_rows(raw)
     client = get_supabase_client()
-    upsert_categories(client, rows)
+    try:
+        upsert_categories(client, rows)
+    except Exception as exc:  # pragma: no cover - DB failure handling
+        logger.error("[1/4] Failed to upsert categories: %s", exc)
+        return []
+
     leaf_ids = [c["id"] for c in rows if c.get("is_leaf")]
     logger.info("[1/4] Stored %d categories (%d leaf)", len(rows), len(leaf_ids))
     return leaf_ids
 
 
-async def sync_products_for_categories(category_ids: Iterable[int]) -> List[int]:
+async def sync_products_for_categories(
+    category_ids: Iterable[int],
+    update_only_existing: bool = False,
+    existing_product_ids: Optional[set[int]] = None,
+) -> List[int]:
+    """Fetch listings for categories and upsert products/sellers.
+
+    When ``update_only_existing`` is True, new products discovered in listings
+    are filtered out so only already-known product IDs are updated.
+    """
+
     client = get_supabase_client()
     all_product_ids: List[int] = []
+    existing_product_ids = existing_product_ids or set()
+
+    category_count = 0
     for idx, cid in enumerate(category_ids, start=1):
+        category_count = idx
         logger.info("[2/4] Category %d: fetching listings (id=%s, up to %d pages)", idx, cid, MAX_PAGES_PER_CATEGORY)
-        listings = await fetch_all_listings_for_category(cid)
-        products, sellers = to_product_and_seller_rows(listings)
+        try:
+            listings = await fetch_all_listings_for_category(cid)
+        except Exception as exc:  # pragma: no cover - network failure handling
+            logger.error("[2/4] Category %d (id=%s): failed to fetch listings: %s", idx, cid, exc)
+            continue
+
+        products, sellers = to_product_and_seller_rows(listings, cid)
+        if update_only_existing:
+            products = [p for p in products if p.get("id") in existing_product_ids]
+            sellers = [s for s in sellers if s.get("id")]
+
         logger.info(
             "[2/4] Category %d: %d listings -> %d products, %d sellers",
             idx,
@@ -54,25 +134,51 @@ async def sync_products_for_categories(category_ids: Iterable[int]) -> List[int]
             len(products),
             len(sellers),
         )
-        upsert_sellers(client, sellers)
-        upsert_products(client, products)
+        try:
+            if sellers:
+                upsert_sellers(client, sellers)
+            if products:
+                upsert_products(client, products)
+        except Exception as exc:  # pragma: no cover - DB failure handling
+            logger.error("[2/4] Category %d (id=%s): failed to upsert products/sellers: %s", idx, cid, exc)
+            continue
         all_product_ids.extend([p["id"] for p in products if p.get("id") is not None])
-    logger.info("[2/4] Finished listings for %d categories; total distinct products: %d", idx if category_ids else 0, len(set(all_product_ids)))
+
+    logger.info("[2/4] Finished listings for %d categories; total distinct products: %d", category_count, len(set(all_product_ids)))
     return list(set(all_product_ids))
 
 
-async def enrich_products_with_details(product_ids: Iterable[int]) -> None:
+async def enrich_products_with_details(product_ids: Iterable[int]) -> tuple[list[int], list[int]]:
+    """Enrich product details and return (failed_ids, processed_ids)."""
+
     client = get_supabase_client()
     product_ids_list = list(product_ids)
     logger.info("[3/4] Enriching %d products with detail API", len(product_ids_list))
     seen_seller_ids: set[int] = set()
+    failed_ids: list[int] = []
+    processed: list[int] = []
+
     for idx, pid in enumerate(product_ids_list, start=1):
         logger.info("[3/4] (%d/%d) Fetching product details for id=%s", idx, len(product_ids_list), pid)
-        data = await fetch_product(pid)
+        try:
+            data = await fetch_product(pid)
+        except httpx.ConnectTimeout:
+            logger.warning("[3/4] Timeout fetching product %s; skipping", pid)
+            failed_ids.append(pid)
+            continue
+        except Exception as exc:  # pragma: no cover - network failure handling
+            logger.warning("[3/4] Error fetching product %s: %s", pid, exc)
+            failed_ids.append(pid)
+            continue
+
         product_row = to_product_row(data)
+        processed.append(pid)
         seller_row = to_seller_row(data)
         if seller_row:
-            upsert_sellers(client, [seller_row])
+            try:
+                upsert_sellers(client, [seller_row])
+            except Exception as exc:  # pragma: no cover - DB failure handling
+                logger.warning("[3/4] Failed to upsert base seller %s: %s", seller_row.get("id"), exc)
             sid = seller_row.get("id")
             if sid and sid not in seen_seller_ids:
                 # Optionally enrich seller info via dedicated seller widget API
@@ -80,16 +186,26 @@ async def enrich_products_with_details(product_ids: Iterable[int]) -> None:
                     seller_widget = await fetch_seller(sid)
                     widget_row = to_seller_row_from_widget(seller_widget)
                     if widget_row:
-                        upsert_sellers(client, [widget_row])
-                        seen_seller_ids.add(sid)
-                        logger.info("[3/4] Enriched seller %s from widget API", sid)
+                        try:
+                            upsert_sellers(client, [widget_row])
+                            seen_seller_ids.add(sid)
+                            logger.info("[3/4] Enriched seller %s from widget API", sid)
+                        except Exception as exc:  # pragma: no cover - DB failure handling
+                            logger.warning("[3/4] Failed to upsert enriched seller %s: %s", sid, exc)
                 except Exception as exc:  # pragma: no cover - best-effort enrichment
                     logger.warning("[3/4] Failed to enrich seller %s: %s", sid, exc)
-        upsert_products(client, [product_row])
+        try:
+            upsert_products(client, [product_row])
+        except Exception as exc:  # pragma: no cover - DB failure handling
+            logger.warning("[3/4] Failed to upsert product %s: %s", product_row.get("id"), exc)
+            failed_ids.append(pid)
     logger.info("[3/4] Product detail enrichment complete")
+    return failed_ids, processed
 
 
-async def sync_reviews_for_products(product_ids: Iterable[int], start_index: int = 0) -> None:
+async def sync_reviews_for_products(product_ids: Iterable[int], start_index: int = 0) -> list[int]:
+    """Fetch reviews and return a list of product IDs that failed."""
+
     client = get_supabase_client()
     product_ids_list = list(product_ids)
     if start_index:
@@ -110,7 +226,10 @@ async def sync_reviews_for_products(product_ids: Iterable[int], start_index: int
             continue
         review_rows, seller_rows = to_review_rows(data)
         if seller_rows:
-            upsert_sellers(client, seller_rows)
+            try:
+                upsert_sellers(client, seller_rows)
+            except Exception as exc:  # pragma: no cover - DB failure handling
+                logger.warning("[4/4] Failed to upsert review sellers for product %s: %s", pid, exc)
         if review_rows:
             # Deduplicate reviews by id within this batch to satisfy ON CONFLICT
             unique_by_id = {}
@@ -120,12 +239,16 @@ async def sync_reviews_for_products(product_ids: Iterable[int], start_index: int
                     continue
                 unique_by_id[rid] = r
             deduped_reviews = list(unique_by_id.values())
-            upsert_reviews(client, deduped_reviews)
+            try:
+                upsert_reviews(client, deduped_reviews)
+            except Exception as exc:  # pragma: no cover - DB failure handling
+                logger.warning("[4/4] Failed to upsert reviews for product %s: %s", pid, exc)
         logger.info("[4/4] Product %s: stored %d reviews", pid, len(review_rows))
     if failed_ids:
         logger.warning("[4/4] Review sync complete with %d failures. Problem product_ids: %s", len(failed_ids), failed_ids)
     else:
         logger.info("[4/4] Review sync complete with no failures")
+    return failed_ids
 
 
 async def sync_sellers_only() -> None:
@@ -145,71 +268,192 @@ async def sync_sellers_only() -> None:
             seller_widget = await fetch_seller(sid)
             widget_row = to_seller_row_from_widget(seller_widget)
             if widget_row:
-                upsert_sellers(client, [widget_row])
+                try:
+                    upsert_sellers(client, [widget_row])
+                except Exception as exc:  # pragma: no cover - DB failure handling
+                    logger.warning("[S] Failed to upsert seller %s from widget: %s", sid, exc)
         except Exception as exc:  # pragma: no cover - best-effort refresh
             logger.warning("[S] Failed to refresh seller %s: %s", sid, exc)
     logger.info("[S] Sellers-only refresh complete")
 
+def _log_error_summary(error_summary: dict[str, list[str]]) -> None:
+    """Log a compact overview of issues encountered during the run.
 
-async def full_milk_run() -> None:
-    logger.info("Run mode: %s", RUN_MODE)
+    This does not affect control flow; it only provides a quick
+    at-a-glance summary at the end so you can see which stages had
+    problems without scrolling through the full log.
+    """
+    any_errors = any(error_summary.values())
+    if not any_errors:
+        logger.info("[SUMMARY] Pipeline completed with no recorded errors in tracked stages.")
+        return
+
+    logger.warning("[SUMMARY] Pipeline completed with issues. Per-stage overview below:")
+    for stage, errors in error_summary.items():
+        if not errors:
+            logger.info("[SUMMARY] %s: OK", stage)
+            continue
+        logger.warning("[SUMMARY] %s: %d issue(s)", stage, len(errors))
+        # Log only the first few messages per stage to avoid clutter.
+        for idx, msg in enumerate(errors[:5], start=1):
+            logger.warning("[SUMMARY]   (%d) %s", idx, msg)
+
+
+async def execute_plan(plan: RunPlan) -> RunResult:
+    """Run the selected stages in order and return a structured result."""
+
+    _validate_plan(plan)
 
     client = get_supabase_client()
     leaf_category_ids: List[int] = []
     product_ids: List[int] = []
+    failed_products: list[int] = []
+    failed_reviews: list[int] = []
 
-    # Special sellers-only mode: refresh sellers and exit early
-    if RUN_MODE == "sellers_only":
-        await sync_sellers_only()
-        return
+    errors: dict[str, list[str]] = {
+        "categories": [],
+        "listings": [],
+        "products_enrich": [],
+        "reviews": [],
+        "sellers": [],
+    }
 
-    # 1. Categories
-    if RUN_MODE in ("full", "products_pipeline", "listings_only"):
-        leaf_category_ids = await sync_categories(DEFAULT_PARENT_CATEGORY_ID)
-    elif RUN_MODE in ("enrich_only", "reviews_only"):
-        res = client.table("category").select("id").eq("is_leaf", True).execute()
-        leaf_category_ids = [row["id"] for row in (res.data or [])]
-        logger.info("[1/4] Using %d existing leaf categories from DB", len(leaf_category_ids))
-    elif RUN_MODE == "categories_only":
-        await sync_categories(DEFAULT_PARENT_CATEGORY_ID)
-        logger.info("[1/4] Categories-only run complete")
-        return
+    # 1. Categories + listings (source for new product IDs)
+    existing_product_ids: set[int] = set()
+    if plan.categories_listings:
+        try:
+            leaf_category_ids = await sync_categories(plan.parent_category_id)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            errors["categories"].append(str(exc))
+        if not leaf_category_ids:
+            errors["categories"].append("No leaf categories returned from sync_categories")
 
-    # 2. Listings / products
-    if RUN_MODE in ("full", "products_pipeline", "listings_only"):
-        product_ids = await sync_products_for_categories(leaf_category_ids)
-    elif RUN_MODE in ("enrich_only", "reviews_only"):
-        res = client.table("product").select("id").execute()
-        product_ids = [row["id"] for row in (res.data or [])]
-        logger.info("[2/4] Using %d existing products from DB", len(product_ids))
+        if plan.mode == "update":
+            existing_product_ids = set(_existing_product_ids(client))
+        try:
+            product_ids = await sync_products_for_categories(
+                leaf_category_ids,
+                update_only_existing=plan.mode == "update",
+                existing_product_ids=existing_product_ids,
+            )
+        except Exception as exc:  # pragma: no cover - defensive guard
+            errors["listings"].append(str(exc))
+            product_ids = []
+        if plan.mode == "update" and not product_ids:
+            errors["listings"].append("No products updated from listings in update mode")
 
-    if RUN_MODE == "listings_only":
-        logger.info("[2/4] Listings-only run complete (no enrichment/reviews)")
-        return
+    # 2. Resolve product ids when listings stage is skipped
+    if plan.product_ids_override:
+        product_ids = list({int(pid) for pid in plan.product_ids_override})
+    elif not product_ids:
+        product_ids = _existing_product_ids(client)
+        logger.info("Using %d existing product ids from DB", len(product_ids))
 
-    # 3. Enrich products
-    if RUN_MODE in ("full", "products_pipeline", "enrich_only"):
-        await enrich_products_with_details(product_ids)
+    # 3. Product enrichment
+    processed_products: list[int] = []
+    if plan.products:
+        try:
+            failed_products, processed_products = await enrich_products_with_details(product_ids)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            errors["products_enrich"].append(str(exc))
     else:
-        logger.info("[3/4] Skipping product enrichment due to run mode")
-
-    if RUN_MODE == "enrich_only":
-        logger.info("[3/4] Enrich-only run complete (no reviews)")
-        return
+        logger.info("Skipping product enrichment by request")
 
     # 4. Reviews
-    if RUN_MODE in ("full", "reviews_only"):
-        # Resume control: change start_index if you want to skip
-        # some products that have already been processed.
-        await sync_reviews_for_products(product_ids, start_index=89)
+    if plan.reviews:
+        try:
+            failed_reviews = await sync_reviews_for_products(product_ids, start_index=plan.start_index_reviews)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            errors["reviews"].append(str(exc))
     else:
-        logger.info("[4/4] Skipping review crawl due to run mode")
+        logger.info("Skipping review crawl by request")
+
+    # 5. Sellers refresh (optional final step)
+    if plan.sellers:
+        try:
+            await sync_sellers_only()
+        except Exception as exc:  # pragma: no cover - defensive guard
+            errors["sellers"].append(str(exc))
+
+    _log_error_summary(errors)
+    return RunResult(
+        errors=errors,
+        failed_review_ids=failed_reviews,
+        failed_product_ids=failed_products,
+        product_ids_processed=list({*product_ids, *processed_products}),
+    )
+
+
+def _parse_args() -> argparse.Namespace:
+    valid_aliases = [
+        "categories_listings",
+        "categories",
+        "listings",
+        "products",
+        "product",
+        "reviews",
+        "review",
+        "sellers",
+        "seller",
+    ]
+    parser = argparse.ArgumentParser(description="Run Tiki pipeline stages")
+    parser.add_argument(
+        "--data",
+        nargs="+",
+        choices=valid_aliases,
+        default=["categories_listings", "products", "reviews", "sellers"],
+        help="Stages to run in order",
+    )
+    parser.add_argument("--mode", choices=["scrape", "update"], default="scrape", help="Scrape new data or update only existing records")
+    parser.add_argument("--product-ids", type=str, help="Comma-separated product IDs to focus (overrides discovery)")
+    parser.add_argument("--start-index", type=int, default=0, help="Start index when resuming reviews")
+    parser.add_argument("--parent-category", type=int, default=DEFAULT_PARENT_CATEGORY_ID, help="Root category id to crawl")
+    return parser.parse_args()
+
+
+def _plan_from_args(args: argparse.Namespace) -> RunPlan:
+    alias_map = {
+        "categories": "categories_listings",
+        "listings": "categories_listings",
+        "product": "products",
+        "review": "reviews",
+        "seller": "sellers",
+    }
+    data = {alias_map.get(item, item) for item in args.data}
+    override_ids: Optional[List[int]] = None
+    if args.product_ids:
+        try:
+            override_ids = [int(x.strip()) for x in args.product_ids.split(",") if x.strip()]
+        except ValueError as exc:
+            raise ValueError("product-ids must be integers separated by commas") from exc
+
+    return RunPlan(
+        categories_listings="categories_listings" in data,
+        products="products" in data,
+        reviews="reviews" in data,
+        sellers="sellers" in data,
+        mode=args.mode,
+        product_ids_override=override_ids,
+        start_index_reviews=args.start_index,
+        parent_category_id=args.parent_category,
+    )
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    asyncio.run(full_milk_run())
+    args = _parse_args()
+    plan = _plan_from_args(args)
+    result = asyncio.run(execute_plan(plan))
+    issues = sum(len(v) for v in result.errors.values())
+    if issues:
+        logger.warning("Run completed with %d recorded issue(s)", issues)
+    if result.failed_review_ids:
+        logger.warning("Review failures: %s", result.failed_review_ids)
+    if result.failed_product_ids:
+        logger.warning("Product enrichment failures: %s", result.failed_product_ids)
 
 
 if __name__ == "__main__":
     main()
+
+

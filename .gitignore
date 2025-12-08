@@ -7,3 +7,5 @@ __pycache__/
 *.pyd
 .pytest_cache/
 notebooks/.ipynb_checkpoints/
+sample_data/
+.gitignore

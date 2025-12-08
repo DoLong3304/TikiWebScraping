@@ -1,182 +1,115 @@
-# Tiki Milk Products Scraping Project
+**Tiki Web Scraping**
 
-This project scrapes Tiki product data (focused on milk categories by default, but extensible to other categories) and stores it in a Supabase (Postgres) database. It is designed to run locally, on Google Colab, or via the Colab extension inside VS Code.
+- Async ETL that discovers Tiki categories, paginates listings, enriches products, captures reviews, and stores everything in Supabase (Postgres).
+- Works for any Tiki category id; the historic default is the milk parent category (8273) but you can override per run.
+- Two entry points: CLI for automation and a Tkinter GUI for guided runs, health checks, stats, and a safe SQL playground.
 
 ---
 
-## 1. Project structure (high level)
+## How the ETL works
 
-- `supabase_schema.sql` – SQL to create tables in your Supabase Postgres database.
+- **Discover**: fetch child categories for a chosen parent category id.
+- **List**: crawl paginated listings for each leaf category with jittered delays.
+- **Enrich**: pull full product details and seller widget data, upserting into Supabase.
+- **Review**: fetch paginated reviews per product with basic deduplication.
+- **Persist**: upsert into `category`, `product`, `seller`, and `review` tables (schema in `supabase_schema.sql`).
+
+---
+
+## Project structure
+
+- `supabase_schema.sql` – tables and indexes for Supabase.
 - `requirements.txt` – Python dependencies.
-- `.env.example` – sample environment variables (copy to `.env`).
-- `src/config.py` – configuration for Tiki endpoints, rate limiting, and Supabase.
-- `src/db/supabase_client.py` – Supabase client and upsert helpers.
-- `src/tiki_client/` – Tiki API clients:
-  - `categories.py` – fetches subcategories.
-  - `listings.py` – fetches product listings per category with pagination.
-  - `products.py` – fetches detailed product info.
-  - `reviews.py` – fetches paginated product reviews.
-  - `sellers.py` – fetches rich seller info from the seller widget API.
-- `src/pipeline/orchestrator.py` – orchestration of scraping stages and run modes.
-- `tests/test_pipeline_smoke.py` – simple smoke test for the pipeline (once you configure Supabase and Python).
+- `src/config.py` – API endpoints, defaults, and tunable limits (env-driven).
+- `src/db/supabase_client.py` – cached Supabase client + upsert helpers.
+- `src/tiki_client/` – API clients for categories, listings, products, reviews, sellers.
+- `src/pipeline/orchestrator.py` – CLI + shared orchestration logic.
+- `src/gui/gui_app.py` / `src/gui/pipeline_runner.py` – Tkinter control panel wrapper.
+- `sample_data/` – offline samples for quick validation.
+- `tests/test_pipeline_smoke.py` – minimal connectivity and mapping test.
 
 ---
 
-## 2. Supabase project setup
+## Prerequisites
 
-1. **Create a Supabase project**
-
-   - Go to https://supabase.com and sign in.
-   - Create a new project (choose a region and a strong database password).
-
-2. **Get connection details**
-
-   - In the Supabase dashboard, open your project.
-   - Go to **Project Settings → API** and note:
-     - `Project URL` (e.g. `https://your-project-id.supabase.co`).
-     - `service_role` key (keep this secret; used by backend only).
-
-3. **Create database schema**
-
-   - In the Supabase dashboard, go to **SQL Editor**.
-   - Create a new query.
-   - Paste the contents of `supabase_schema.sql` from this repo.
-   - Run the script; it will create the `category`, `product`, `seller`, `review`, and `product_category` tables and indexes.
-
-4. **(Optional) Check tables**
-
-   - Go to **Table Editor** and confirm the tables exist.
-
-5. **Security note**
-   - For this educational backend-only project, you’ll typically use the `service_role` key from trusted environments (local terminal or Colab). Do **not** expose it in any public frontend.
+- Python 3.10+ on your machine or Colab runtime.
+- Supabase project with a service role key.
+- Network access to `tiki.vn` and your Supabase endpoint.
 
 ---
 
-## 3. Environment variables
+## Setup
 
-Copy `.env.example` to `.env` and fill in values:
-
-```bash
-cp .env.example .env
-```
-
-On Windows PowerShell:
-
-```powershell
-Copy-Item .env.example .env
-```
-
-Then edit `.env`:
-
-- `SUPABASE_URL=https://your-project-id.supabase.co`
-- `SUPABASE_SERVICE_KEY=your-service-role-key`
-- (Optional) tune rate limiting: `TIKI_MAX_CONCURRENT_REQUESTS`, `TIKI_BASE_DELAY_SECONDS`, etc.
-- (Optional) control which stages run: `TIKI_RUN_MODE` (see below).
-
-You can also export env vars directly in your shell instead of using `.env`.
-
----
-
-## 4. Installing Python dependencies
-
-From the project root:
-
-```bash
-pip install -r requirements.txt
-```
-
-On Windows PowerShell (once Python is installed and on PATH):
+1. Clone the repo and install deps
 
 ```powershell
 cd "C:\Users\dohai\PycharmProjects\TikiWebScraping2"
 python -m pip install -r requirements.txt
 ```
 
-If you prefer a virtual environment, create and activate it before running the install command.
+2. Provision Supabase schema
+
+- In the Supabase SQL editor, run the contents of `supabase_schema.sql`.
+
+3. Configure environment
+
+- Create `.env` and fill the following info:
+  - `SUPABASE_URL=https://<project>.supabase.co`
+  - `SUPABASE_SERVICE_KEY=<service_role_key>`
+  - `TIKI_PARENT_CATEGORY_ID=<category_id>` (optional; default 8273)
+  - Optional tuning: `TIKI_MAX_PAGES_PER_CATEGORY`, `TIKI_MAX_REVIEW_PAGES_PER_PRODUCT`, `TIKI_BASE_DELAY_SECONDS`, `TIKI_JITTER_RANGE`.
 
 ---
 
-## 5. Running the pipeline locally
+## Run (CLI)
 
-Ensure environment variables are set (either via `.env` loaded by your IDE or directly in the shell).
+Stages always run in order: categories/listings → products → reviews → sellers.
 
-### 5.1 Run modes
+- Full scrape + update (default parent category):
 
-The orchestrator supports several **run modes** controlled by `TIKI_RUN_MODE`:
+```powershell
+python -m src.pipeline.orchestrator
+```
 
-- `full` (default):
-  - Categories → listings/products → product detail enrichment (including seller widget enrichment) → reviews.
-- `categories_only`:
-  - Only refresh categories under the configured parent (default `8273`), then stop.
-- `listings_only`:
-  - Refresh categories and product listings; upsert basic products and sellers, but **skip** product detail enrichment and reviews.
-- `products_pipeline`:
-  - Categories → listings/products → product detail enrichment (including seller widget enrichment), but **skip** reviews.
-- `enrich_only`:
-  - Reuse existing products from the database and only re-enrich product details and sellers (no new listings, no reviews).
-- `reviews_only`:
-  - Reuse existing products from the database and only refresh reviews for those products.
-- `sellers_only`:
-  - Reuse existing seller IDs from the `seller` table and refresh them via the seller widget API only (no product or review changes).
+- Update existing records only:
 
-### 5.2 Example commands (Windows PowerShell)
+```powershell
+python -m src.pipeline.orchestrator --mode update
+```
 
-- Full pipeline:
+- Target a different category root:
 
-  ```powershell
-  $env:TIKI_RUN_MODE="full"
-  python -m src.pipeline.orchestrator
-  ```
+```powershell
+python -m src.pipeline.orchestrator --parent-category 8322
+```
 
-- Categories only:
+- Reviews only for specific products:
 
-  ```powershell
-  $env:TIKI_RUN_MODE="categories_only"
-  python -m src.pipeline.orchestrator
-  ```
+```powershell
+python -m src.pipeline.orchestrator --data reviews --mode update --product-ids 123,456
+```
 
-- Listings + products + seller enrichment (no reviews):
+- Skip sellers refresh:
 
-  ```powershell
-  $env:TIKI_RUN_MODE="products_pipeline"
-  python -m src.pipeline.orchestrator
-  ```
+```powershell
+python -m src.pipeline.orchestrator --data categories_listings products reviews --mode scrape
+```
 
-- Listings only (no enrichment, no reviews):
-
-  ```powershell
-  $env:TIKI_RUN_MODE="listings_only"
-  python -m src.pipeline.orchestrator
-  ```
-
-- Enrich products and sellers only:
-
-  ```powershell
-  $env:TIKI_RUN_MODE="enrich_only"
-  python -m src.pipeline.orchestrator
-  ```
-
-- Reviews only:
-
-  ```powershell
-  $env:TIKI_RUN_MODE="reviews_only"
-  python -m src.pipeline.orchestrator
-  ```
-
-- Sellers only (widget-based enrichment for existing sellers):
-
-  ```powershell
-  $env:TIKI_RUN_MODE="sellers_only"
-  python -m src.pipeline.orchestrator
-  ```
+Args of interest: `--data` (stages), `--mode` (`scrape`|`update`), `--product-ids`, `--start-index`, `--parent-category`.
 
 ---
 
-## 6. Running on Google Colab
+## Run (GUI)
 
-### 6.1 Regular Colab notebook (in browser)
+```powershell
+python -m src.gui.gui_app
+```
 
-In a new Colab notebook cell:
+What you get: connectivity checks, runtime settings (parent category, paging caps, delays), ordered run plan, retry failed reviews, Supabase vs Tiki stats, and a guarded SQL editor (`SELECT ... FROM <table> [LIMIT n]`).
+
+---
+
+## Run on Colab
 
 ```python
 !git clone YOUR_REPO_URL
@@ -186,63 +119,44 @@ In a new Colab notebook cell:
 import os
 os.environ["SUPABASE_URL"] = "https://your-project-id.supabase.co"
 os.environ["SUPABASE_SERVICE_KEY"] = "your-service-role-key"
+os.environ["TIKI_PARENT_CATEGORY_ID"] = "8273"  # or any category id
 
-!python -m src.pipeline.orchestrator
+!python -m src.pipeline.orchestrator --data categories_listings products
 ```
-
-Replace `YOUR_REPO_URL` and Supabase credentials with your values.
-
-### 6.2 Colab extension inside VS Code
-
-With the Colab extension already installed in VS Code:
-
-1. Open this project folder in VS Code.
-2. Use the Colab extension command (e.g. **Open in Colab** or similar, depending on extension version) to create or connect to a Colab-backed notebook.
-3. In the Colab-backed notebook within VS Code, run the same commands as above:
-
-```python
-!git clone YOUR_REPO_URL
-%cd TikiWebScraping2
-!pip install -r requirements.txt
-
-import os
-os.environ["SUPABASE_URL"] = "https://your-project-id.supabase.co"
-os.environ["SUPABASE_SERVICE_KEY"] = "your-service-role-key"
-
-!python -m src.pipeline.orchestrator
-```
-
-You’re still executing on Colab’s cloud runtime, but authoring from VS Code.
 
 ---
 
-## 7. Smoke test module
+## Troubleshooting (Q&A)
 
-There is a simple smoke test at `tests/test_pipeline_smoke.py` that:
+- **"Missing SUPABASE_URL/SUPABASE_SERVICE_KEY"**: export them in the shell or place them in `.env` and restart the shell/IDE.
+- **"Permission denied on Supabase"**: confirm you are using the service role key, not the anon key.
+- **"No leaf categories returned"**: verify `TIKI_PARENT_CATEGORY_ID` is valid and reachable from your network.
+- **"Pipeline hangs on reviews"**: reduce `TIKI_MAX_REVIEW_PAGES_PER_PRODUCT` or increase `TIKI_BASE_DELAY_SECONDS` to be gentler.
+- **"Rate limited by Tiki"**: lower concurrency via `TIKI_MAX_CONCURRENT_REQUESTS` (the HTTP client already jitters between pages).
 
-- Verifies Supabase environment variables are available.
-- Instantiates a Supabase client.
-- Optionally runs a very small subset of the pipeline (e.g. just category sync) to ensure connectivity.
+---
 
-To run tests (once Python is installed and `pytest` is available):
+## Example use cases
 
-```bash
-pytest -q
-```
+- Build a price tracker for any Tiki category id.
+- Enrich a subset of products by passing `--product-ids` for focused refresh.
+- Compare Tiki estimates vs Supabase counts using the GUI stats tab before running a full crawl.
+- Export review text from Supabase to downstream analytics/BI tools.
 
-On Windows PowerShell:
+---
+
+## Tests
 
 ```powershell
 pytest -q
 ```
 
-If `pytest` is not installed, you can install it with `pip install pytest` or run the test module directly with `python -m tests.test_pipeline_smoke`.
+`tests/test_pipeline_smoke.py` checks env wiring, Supabase connectivity, and basic category mapping using local sample data.
 
 ---
 
-## 8. Next steps and extensions
+## Notes
 
-- Add more sophisticated incremental logic (e.g. only re-scrape reviews for products where counts have changed).
-- Add data cleaning and normalization steps on top of the raw tables.
-- Connect Power BI or other BI tools directly to Supabase for visualization.
-- Enable `pgvector` in Supabase for LLM-based analytics over review text.
+- The default parent category remains the historic milk category for backward compatibility; override it per run for other domains.
+- Supabase client is cached per process to reduce overhead.
+- Network calls are best-effort; errors are logged and summarized per stage so runs can continue.

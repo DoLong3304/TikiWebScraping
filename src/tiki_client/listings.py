@@ -40,7 +40,10 @@ async def fetch_all_listings_for_category(category_id: int) -> List[Dict[str, An
     return listings
 
 
-def to_product_and_seller_rows(listings: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def to_product_and_seller_rows(
+    listings: List[Dict[str, Any]],
+    category_id: int,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     products: List[Dict[str, Any]] = []
     sellers: Dict[int, Dict[str, Any]] = {}
 
@@ -58,7 +61,7 @@ def to_product_and_seller_rows(listings: List[Dict[str, Any]]) -> Tuple[List[Dic
                 "sku": item.get("sku"),
                 "name": item.get("name"),
                 "brand": brand_name,
-                "category_id": None,  # can be refined later using primary_category_path
+                "category_id": category_id,
                 "price": item.get("price"),
                 "list_price": item.get("list_price"),
                 "original_price": item.get("original_price"),
