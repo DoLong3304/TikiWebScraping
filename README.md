@@ -1,4 +1,4 @@
-**Tiki Web Scraping**
+# **Tiki Web Scraping**
 
 - Async ETL that discovers Tiki categories, paginates listings, enriches products, captures reviews, and stores everything in Supabase (Postgres).
 - Works for any Tiki category id; the historic default is the milk parent category (8273) but you can override per run.
