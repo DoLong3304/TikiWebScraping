@@ -186,16 +186,21 @@ class GuiApp:
 
         self.var_mode = tk.StringVar(value="scrape")
         ttk.Label(controls, text="Mode").grid(row=0, column=1, sticky="w", padx=4, pady=2)
-        ttk.Radiobutton(controls, text="Scrape new + update", variable=self.var_mode, value="scrape").grid(row=1, column=1, sticky="w", padx=4, pady=2)
+        ttk.Radiobutton(controls, text="Scrape new entries", variable=self.var_mode, value="scrape").grid(row=1, column=1, sticky="w", padx=4, pady=2)
         ttk.Radiobutton(controls, text="Update existing only", variable=self.var_mode, value="update").grid(row=2, column=1, sticky="w", padx=4, pady=2)
 
         self.var_product_override = tk.StringVar()
         ttk.Label(controls, text="Product IDs (comma) to focus").grid(row=3, column=1, sticky="w", padx=4, pady=2)
         ttk.Entry(controls, textvariable=self.var_product_override, width=50).grid(row=4, column=1, sticky="w", padx=4, pady=2)
 
-        ttk.Button(controls, text="Run selected", command=self._on_run_selected).grid(row=5, column=0, padx=4, pady=6, sticky="w")
-        ttk.Button(controls, text="Retry failed reviews", command=self._on_retry_failed).grid(row=5, column=1, padx=4, pady=6, sticky="w")
-        ttk.Button(controls, text="Clear logs", command=self._clear_logs).grid(row=5, column=2, padx=4, pady=6, sticky="w")
+        # Run/Stop/Retry controls
+        self.btn_run = ttk.Button(controls, text="Run selected", command=self._on_run_selected)
+        self.btn_run.grid(row=5, column=0, padx=4, pady=6, sticky="w")
+        self.btn_stop = ttk.Button(controls, text="Stop", command=self._on_stop_clicked, state="disabled")
+        self.btn_stop.grid(row=5, column=1, padx=4, pady=6, sticky="w")
+        self.btn_retry = ttk.Button(controls, text="Retry failed reviews", command=self._on_retry_failed)
+        self.btn_retry.grid(row=5, column=2, padx=4, pady=6, sticky="w")
+        ttk.Button(controls, text="Clear logs", command=self._clear_logs).grid(row=5, column=3, padx=4, pady=6, sticky="w")
 
         self.stage_listbox.bind("<<ListboxSelect>>", lambda _: self._update_run_summary())
         self.var_mode.trace_add("write", lambda *_: self._update_run_summary())
@@ -294,16 +299,42 @@ class GuiApp:
         plan = self._plan_from_form()
         if plan is None:
             return
+        # Disable run and retry while a plan is executing and enable Stop.
+        self.btn_run.configure(state="disabled")
+        self.btn_retry.configure(state="disabled")
+        self.btn_stop.configure(state="normal")
         self._run_in_thread(lambda: self._execute_plan(plan))
+
+    def _on_stop_clicked(self) -> None:
+        """Request the current pipeline run to stop if supported by runner."""
+        try:
+            self.runner.stop()
+            logging.info("Stop requested by user.")
+        except AttributeError:
+            logging.warning("Runner does not support stop(); ignoring stop request")
+        # Optimistically re-enable Run and Retry; the background thread
+        # should finish shortly after stop is honoured.
+        self.btn_run.configure(state="normal")
+        self.btn_retry.configure(state="normal")
+        self.btn_stop.configure(state="disabled")
 
     def _execute_plan(self, plan: RunPlan) -> None:
         logging.info("Starting run: %s", plan)
-        errors = self.runner.run_plan(plan)
-        issues = sum(len(v) for v in errors.values())
-        if issues:
-            logging.warning("Run completed with %d issue(s). See log.", issues)
-        else:
-            logging.info("Run completed successfully.")
+        try:
+            errors = self.runner.run_plan(plan)
+            issues = sum(len(v) for v in errors.values())
+            if issues:
+                logging.warning("Run completed with %d issue(s). See log.", issues)
+            else:
+                logging.info("Run completed successfully.")
+        finally:
+            # Make sure buttons are reset even if an exception occurs.
+            def _reset_buttons() -> None:
+                self.btn_run.configure(state="normal")
+                self.btn_retry.configure(state="normal")
+                self.btn_stop.configure(state="disabled")
+
+            self.root.after(0, _reset_buttons)
 
     def _on_retry_failed(self) -> None:
         if not self.runner.failed_review_ids:
@@ -384,9 +415,23 @@ class GuiApp:
         self.root.after(200, self._poll_log_queue)
 
     def _append_log(self, msg: str) -> None:
+        # Preserve the user's scroll position: only auto-scroll if the
+        # view is already at (or very close to) the bottom when a new
+        # log line arrives.
         self.log_text.configure(state="normal")
+
+        try:
+            # yview returns (first, last) as fractions of the content.
+            first, last = self.log_text.yview()
+        except Exception:  # pragma: no cover - defensive guard
+            first, last = 0.0, 1.0
+
+        at_bottom = abs(last - 1.0) < 0.01
+
         self.log_text.insert(tk.END, msg + "\n")
-        self.log_text.see(tk.END)
+        if at_bottom:
+            # Only auto-scroll when the user was already at the bottom.
+            self.log_text.see(tk.END)
         self.log_text.configure(state="disabled")
 
     def _clear_logs(self) -> None:

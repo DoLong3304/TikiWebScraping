@@ -51,3 +51,52 @@ def upsert_reviews(client: Client, rows: List[Dict[str, Any]]) -> None:
     if not rows:
         return
     client.table("review").upsert(rows).execute()
+
+
+def update_product_details_sql(client: Any, row: dict[str, Any]) -> None:
+    """Update a subset of product columns using a raw SQL statement.
+
+    This is used for detail-enrichment in update mode so that we never
+    touch ``category_id`` via upsert, which could introduce NULLs or
+    foreign-key issues for historic rows.
+    """
+    # Columns we allow detail API to overwrite. ``category_id`` is
+    # intentionally excluded so it remains sourced from listings.
+    columns = [
+        "name",
+        "brand",
+        "brand_id",
+        "price",
+        "list_price",
+        "original_price",
+        "discount",
+        "discount_rate",
+        "rating_average",
+        "review_count",
+        "all_time_quantity_sold",
+        "thumbnail_url",
+        "tiki_url",
+        "seller_id",
+        "specifications",
+        "badges",
+        "badges_new",
+        "badges_v3",
+        "highlight",
+        "extra",
+        "master_id",
+        "sku",
+    ]
+    product_id = row.get("id")
+    if product_id is None:
+        return
+
+    payload: Dict[str, Any] = {}
+    for col in columns:
+        if col in row:
+            payload[col] = row[col]
+
+    if not payload:
+        return
+
+    # This issues: PATCH /product?id=eq.<id> with only the given columns.
+    client.table("product").update(payload).eq("id", product_id).execute()

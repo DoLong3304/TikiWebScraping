@@ -2,7 +2,7 @@ import argparse
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import Iterable, List, Literal, Optional
+from typing import Iterable, List, Literal, Optional, Any
 
 from src.config import DEFAULT_PARENT_CATEGORY_ID, MAX_PAGES_PER_CATEGORY, MAX_REVIEW_PAGES_PER_PRODUCT
 from src.db.supabase_client import (
@@ -11,6 +11,7 @@ from src.db.supabase_client import (
     upsert_products,
     upsert_reviews,
     upsert_sellers,
+    update_product_details_sql,
 )
 from src.tiki_client.categories import fetch_categories, to_category_rows
 from src.tiki_client.listings import (
@@ -52,7 +53,7 @@ class RunResult:
     product_ids_processed: list[int] = field(default_factory=list)
 
 
-def _existing_product_ids(client: any) -> List[int]:
+def _existing_product_ids(client: Any) -> List[int]:
     res = client.table("product").select("id").execute()
     return [row["id"] for row in (res.data or [])]
 
@@ -148,18 +149,45 @@ async def sync_products_for_categories(
     return list(set(all_product_ids))
 
 
-async def enrich_products_with_details(product_ids: Iterable[int]) -> tuple[list[int], list[int]]:
-    """Enrich product details and return (failed_ids, processed_ids)."""
+async def enrich_products_with_details(
+    product_ids: Iterable[int],
+    *,
+    mode: Literal["scrape", "update"],
+    existing_product_ids: Optional[set[int]] = None,
+) -> tuple[list[int], list[int]]:
+    """Enrich product details and return (failed_ids, processed_ids).
+
+    Behaviour by mode:
+    - scrape: only enrich products that *do not* exist in DB yet, using
+      regular upsert (rows are expected to have valid category_id already
+      from listings).
+    - update: only enrich products that *do* exist in DB, and apply
+      updates via a narrow SQL UPDATE so ``category_id`` is never touched.
+    """
 
     client = get_supabase_client()
-    product_ids_list = list(product_ids)
-    logger.info("[3/4] Enriching %d products with detail API", len(product_ids_list))
+    existing_ids: set[int] = set(existing_product_ids or set())
+
+    incoming_ids = list(dict.fromkeys(int(pid) for pid in product_ids))
+    if mode == "scrape":
+        # Skip already-known products entirely so we don't touch their
+        # existing category_id or other fields when running a fresh scrape.
+        target_ids = [pid for pid in incoming_ids if pid not in existing_ids]
+    else:  # mode == "update"
+        # Only update products that already exist in DB; ignore stray ids.
+        target_ids = [pid for pid in incoming_ids if pid in existing_ids]
+
+    logger.info(
+        "[3/4] Enriching %d products with detail API (mode=%s)",
+        len(target_ids),
+        mode,
+    )
     seen_seller_ids: set[int] = set()
     failed_ids: list[int] = []
     processed: list[int] = []
 
-    for idx, pid in enumerate(product_ids_list, start=1):
-        logger.info("[3/4] (%d/%d) Fetching product details for id=%s", idx, len(product_ids_list), pid)
+    for idx, pid in enumerate(target_ids, start=1):
+        logger.info("[3/4] (%d/%d) Fetching product details for id=%s", idx, len(target_ids), pid)
         try:
             data = await fetch_product(pid)
         except httpx.ConnectTimeout:
@@ -194,10 +222,18 @@ async def enrich_products_with_details(product_ids: Iterable[int]) -> tuple[list
                             logger.warning("[3/4] Failed to upsert enriched seller %s: %s", sid, exc)
                 except Exception as exc:  # pragma: no cover - best-effort enrichment
                     logger.warning("[3/4] Failed to enrich seller %s: %s", sid, exc)
+
         try:
-            upsert_products(client, [product_row])
+            if mode == "scrape":
+                # In scrape mode we may be inserting brand new rows that
+                # already have category_id set from listings.
+                upsert_products(client, [product_row])
+            else:
+                # In update mode, avoid upsert to keep category_id fully
+                # controlled by the listings stage; update only other fields.
+                update_product_details_sql(client, product_row)
         except Exception as exc:  # pragma: no cover - DB failure handling
-            logger.warning("[3/4] Failed to upsert product %s: %s", product_row.get("id"), exc)
+            logger.warning("[3/4] Failed to persist product %s: %s", product_row.get("id"), exc)
             failed_ids.append(pid)
     logger.info("[3/4] Product detail enrichment complete")
     return failed_ids, processed
@@ -276,6 +312,7 @@ async def sync_sellers_only() -> None:
             logger.warning("[S] Failed to refresh seller %s: %s", sid, exc)
     logger.info("[S] Sellers-only refresh complete")
 
+
 def _log_error_summary(error_summary: dict[str, list[str]]) -> None:
     """Log a compact overview of issues encountered during the run.
 
@@ -349,11 +386,19 @@ async def execute_plan(plan: RunPlan) -> RunResult:
         product_ids = _existing_product_ids(client)
         logger.info("Using %d existing product ids from DB", len(product_ids))
 
+    # Ensure we have existing ids available for enrichment rules in both modes
+    if not existing_product_ids:
+        existing_product_ids = set(_existing_product_ids(client))
+
     # 3. Product enrichment
     processed_products: list[int] = []
     if plan.products:
         try:
-            failed_products, processed_products = await enrich_products_with_details(product_ids)
+            failed_products, processed_products = await enrich_products_with_details(
+                product_ids,
+                mode=plan.mode,
+                existing_product_ids=existing_product_ids,
+            )
         except Exception as exc:  # pragma: no cover - defensive guard
             errors["products_enrich"].append(str(exc))
     else:
@@ -455,5 +500,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 

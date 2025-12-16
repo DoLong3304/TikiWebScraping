@@ -16,10 +16,22 @@ async def fetch_product(product_id: int) -> Dict[str, Any]:
 def to_product_row(data: Dict[str, Any]) -> Dict[str, Any]:
     brand = data.get("brand") or {}
     current_seller = data.get("current_seller") or {}
-    # NOTE: We intentionally do not derive category_id from the product
-    # detail payload because products may belong to multiple categories.
-    # The authoritative category_id comes from the listing crawl, so we
-    # leave category_id unchanged during enrichment.
+
+    # IMPORTANT: Do NOT include "category_id" here.
+    # Products are first inserted from listing pages via
+    # ``to_product_and_seller_rows(..., category_id)`` where the
+    # category id is guaranteed to exist in the ``category`` table.
+    #
+    # The detail API may:
+    #   * return a different category than the listing, or
+    #   * omit category information altogether.
+    #
+    # If we were to upsert a row that contains "category_id": None,
+    # Supabase/Postgres would try to overwrite the existing non-null
+    # category_id with NULL and violate the NOT NULL + FK constraint.
+    #
+    # By never sending "category_id" in this payload, the upsert
+    # leaves the already-stored value untouched.
 
     return {
         "id": data.get("id"),
