@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import threading
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -24,7 +25,9 @@ from src.config import (
     MAX_REVIEW_PAGES_PER_PRODUCT,
 )
 from src.db.supabase_client import get_supabase_client
-from src.pipeline.orchestrator import RunPlan, RunResult, execute_plan
+from src.pipeline.orchestrator import RunPlan, RunResult, execute_plan, run_transform_only
+from src.pipeline.transform import TransformPlan
+from src.pipeline.extract import extract_all
 from src.tiki_client.categories import fetch_categories, to_category_rows
 from src.tiki_client.listings import fetch_listing_page
 
@@ -61,6 +64,8 @@ class PipelineRunner:
         self.settings = settings or RuntimeSettings()
         self.failed_review_ids: list[int] = []
         self.failed_product_ids: list[int] = []
+        self._stop_requested = False
+        self._active_thread: Optional[threading.Thread] = None
 
     # ------------------------------------------------------------------
     # Connection checks
@@ -159,10 +164,72 @@ class PipelineRunner:
 
         self.settings.apply_to_config()
         plan.parent_category_id = self.settings.parent_category_id
-        result: RunResult = asyncio.run(execute_plan(plan))
+        self._stop_requested = False
+        result: RunResult = asyncio.run(
+            execute_plan(
+                plan,
+                should_stop=lambda: self._stop_requested,
+            )
+        )
         self.failed_review_ids = result.failed_review_ids
         self.failed_product_ids = result.failed_product_ids
         return result.errors
+
+    def run_extract(self, mode: str = "scrape") -> Dict[str, int]:
+        """Convenience method to run the full extract stage synchronously."""
+
+        self.settings.apply_to_config()
+        self._stop_requested = False
+        mode_val = mode if mode in {"scrape", "update"} else "scrape"
+        result = extract_all(parent_id=self.settings.parent_category_id, mode=mode_val)
+        return {
+            "categories": result.categories,
+            "products": result.products,
+            "sellers": result.sellers,
+            "reviews": result.reviews,
+        }
+
+    def run_transform(self, plan: Optional[TransformPlan] = None) -> Dict[str, int]:
+        """Run the public -> cleaned transform synchronously."""
+
+        self.settings.apply_to_config()
+        self._stop_requested = False
+        result = asyncio.run(run_transform_only(plan))
+        return {
+            "dim_category_rows": result.dim_category_rows,
+            "dim_seller_rows": result.dim_seller_rows,
+            "dim_product_rows": result.dim_product_rows,
+            "product_ingredient_rows": result.product_ingredient_rows,
+            "review_clean_rows": result.review_clean_rows,
+            "review_daily_rows": result.review_daily_rows,
+            "review_summary_rows": result.review_summary_rows,
+        }
+
+    def build_transform_plan(
+        self,
+        *,
+        dim_category: bool,
+        dim_seller: bool,
+        dim_product: bool,
+        product_ingredients: bool,
+        review_clean: bool,
+        review_daily: bool,
+        review_summary: bool,
+    ) -> TransformPlan:
+        return TransformPlan(
+            dim_category=dim_category,
+            dim_seller=dim_seller,
+            dim_product=dim_product,
+            product_ingredients=product_ingredients,
+            review_clean=review_clean,
+            review_daily=review_daily,
+            review_summary=review_summary,
+        )
+
+    def stop(self) -> None:
+        """Signal cooperative cancellation for long-running tasks."""
+
+        self._stop_requested = True
 
     # ------------------------------------------------------------------
     # Retry helpers

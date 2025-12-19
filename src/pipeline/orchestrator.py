@@ -3,6 +3,7 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import Iterable, List, Literal, Optional, Any
+from collections.abc import Callable
 
 from src.config import DEFAULT_PARENT_CATEGORY_ID, MAX_PAGES_PER_CATEGORY, MAX_REVIEW_PAGES_PER_PRODUCT
 from src.db.supabase_client import (
@@ -22,6 +23,15 @@ from src.tiki_client.products import fetch_product, to_product_row, to_seller_ro
 import httpx
 from src.tiki_client.reviews import fetch_all_reviews_for_product, to_review_rows
 from src.tiki_client.sellers import fetch_seller, to_seller_row_from_widget
+from src.pipeline.transform import run_full_transform, TransformResult
+from src.pipeline.transform import TransformPlan, run_transform_with_plan
+from src.pipeline.extract import (
+    extract_categories_async,
+    extract_listings_for_categories_async,
+    extract_product_details_async,
+    extract_reviews_for_products_async,
+    extract_sellers_only_async,
+)
 
 
 logger = logging.getLogger("tiki_pipeline")
@@ -336,17 +346,11 @@ def _log_error_summary(error_summary: dict[str, list[str]]) -> None:
             logger.warning("[SUMMARY]   (%d) %s", idx, msg)
 
 
-async def execute_plan(plan: RunPlan) -> RunResult:
-    """Run the selected stages in order and return a structured result."""
-
-    _validate_plan(plan)
-
+async def extract_by_plan(
+    plan: RunPlan,
+    should_stop: Optional[Callable[[], bool]] = None,
+) -> tuple[List[int], set[int], dict[str, list[str]], list[int], list[int]]:
     client = get_supabase_client()
-    leaf_category_ids: List[int] = []
-    product_ids: List[int] = []
-    failed_products: list[int] = []
-    failed_reviews: list[int] = []
-
     errors: dict[str, list[str]] = {
         "categories": [],
         "listings": [],
@@ -355,78 +359,155 @@ async def execute_plan(plan: RunPlan) -> RunResult:
         "sellers": [],
     }
 
-    # 1. Categories + listings (source for new product IDs)
     existing_product_ids: set[int] = set()
+    product_ids: List[int] = []
+    failed_products: list[int] = []
+    processed_products: list[int] = []
+    failed_reviews: list[int] = []
+
+    def _stopped() -> bool:
+        return bool(should_stop and should_stop())
+
+    if _stopped():
+        logger.info("Stop requested before extract stages began")
+        return product_ids, existing_product_ids, errors, failed_products, failed_reviews
+
     if plan.categories_listings:
         try:
-            leaf_category_ids = await sync_categories(plan.parent_category_id)
-        except Exception as exc:  # pragma: no cover - defensive guard
+            leaf_category_ids = await extract_categories_async(plan.parent_category_id)
+        except Exception as exc:
             errors["categories"].append(str(exc))
+            leaf_category_ids = []
         if not leaf_category_ids:
-            errors["categories"].append("No leaf categories returned from sync_categories")
+            errors["categories"].append("No leaf categories returned from categories stage")
+
+        if _stopped():
+            logger.info("Stop requested during categories stage")
+            return product_ids, existing_product_ids, errors, failed_products, failed_reviews
 
         if plan.mode == "update":
-            existing_product_ids = set(_existing_product_ids(client))
+            existing_product_ids = {pid for pid in _existing_product_ids(client)}
         try:
-            product_ids = await sync_products_for_categories(
+            product_ids = await extract_listings_for_categories_async(
                 leaf_category_ids,
-                update_only_existing=plan.mode == "update",
+                update_only_existing=(plan.mode == "update"),
                 existing_product_ids=existing_product_ids,
             )
-        except Exception as exc:  # pragma: no cover - defensive guard
+        except Exception as exc:
             errors["listings"].append(str(exc))
             product_ids = []
         if plan.mode == "update" and not product_ids:
             errors["listings"].append("No products updated from listings in update mode")
+        if _stopped():
+            logger.info("Stop requested during listings stage")
+            return product_ids, existing_product_ids, errors, failed_products, failed_reviews
+    else:
+        if plan.product_ids_override:
+            product_ids = list({int(pid) for pid in plan.product_ids_override})
+        else:
+            product_ids = list(_existing_product_ids(client))
 
-    # 2. Resolve product ids when listings stage is skipped
-    if plan.product_ids_override:
-        product_ids = list({int(pid) for pid in plan.product_ids_override})
-    elif not product_ids:
-        product_ids = _existing_product_ids(client)
-        logger.info("Using %d existing product ids from DB", len(product_ids))
-
-    # Ensure we have existing ids available for enrichment rules in both modes
     if not existing_product_ids:
-        existing_product_ids = set(_existing_product_ids(client))
+        existing_product_ids = {pid for pid in _existing_product_ids(client)}
 
-    # 3. Product enrichment
-    processed_products: list[int] = []
     if plan.products:
         try:
-            failed_products, processed_products = await enrich_products_with_details(
+            failed_products, processed_products = await extract_product_details_async(
                 product_ids,
                 mode=plan.mode,
                 existing_product_ids=existing_product_ids,
             )
-        except Exception as exc:  # pragma: no cover - defensive guard
+        except Exception as exc:
             errors["products_enrich"].append(str(exc))
+        if _stopped():
+            logger.info("Stop requested during product enrichment stage")
+            return product_ids, existing_product_ids, errors, failed_products, failed_reviews
     else:
         logger.info("Skipping product enrichment by request")
 
-    # 4. Reviews
     if plan.reviews:
         try:
-            failed_reviews = await sync_reviews_for_products(product_ids, start_index=plan.start_index_reviews)
-        except Exception as exc:  # pragma: no cover - defensive guard
+            failed_reviews, _ = await extract_reviews_for_products_async(product_ids, start_index=plan.start_index_reviews)
+        except Exception as exc:
             errors["reviews"].append(str(exc))
+        if _stopped():
+            logger.info("Stop requested during reviews stage")
+            return product_ids, existing_product_ids, errors, failed_products, failed_reviews
     else:
         logger.info("Skipping review crawl by request")
 
-    # 5. Sellers refresh (optional final step)
     if plan.sellers:
         try:
-            await sync_sellers_only()
-        except Exception as exc:  # pragma: no cover - defensive guard
+            await extract_sellers_only_async()
+        except Exception as exc:
             errors["sellers"].append(str(exc))
+        if _stopped():
+            logger.info("Stop requested during sellers stage")
+    else:
+        logger.info("Skipping seller refresh by request")
+
+    return product_ids, existing_product_ids, errors, failed_products, failed_reviews
+
+
+async def execute_plan(
+    plan: RunPlan,
+    *,
+    should_stop: Optional[Callable[[], bool]] = None,
+) -> RunResult:
+    _validate_plan(plan)
+    product_ids, existing_product_ids, errors, failed_products, failed_reviews = await extract_by_plan(
+        plan,
+        should_stop=should_stop,
+    )
 
     _log_error_summary(errors)
     return RunResult(
         errors=errors,
         failed_review_ids=failed_reviews,
         failed_product_ids=failed_products,
-        product_ids_processed=list({*product_ids, *processed_products}),
+        product_ids_processed=list({*product_ids}),
     )
+
+
+TRANSFORM_STAGE_ALIASES = {
+    "dim_category": "dim_category",
+    "category": "dim_category",
+    "dim_seller": "dim_seller",
+    "seller": "dim_seller",
+    "dim_product": "dim_product",
+    "product": "dim_product",
+    "product_ingredients": "product_ingredients",
+    "ingredients": "product_ingredients",
+    "review_clean": "review_clean",
+    "reviews": "review_clean",
+    "review_daily": "review_daily",
+    "review_summary": "review_summary",
+}
+
+
+def _transform_plan_from_aliases(aliases: list[str]) -> TransformPlan:
+    if not aliases:
+        return TransformPlan()
+    normalized = {TRANSFORM_STAGE_ALIASES.get(item, item) for item in aliases}
+    plan = TransformPlan(
+        dim_category="dim_category" in normalized,
+        dim_seller="dim_seller" in normalized,
+        dim_product="dim_product" in normalized,
+        product_ingredients="product_ingredients" in normalized,
+        review_clean="review_clean" in normalized,
+        review_daily="review_daily" in normalized,
+        review_summary="review_summary" in normalized,
+    )
+    return plan
+
+
+async def run_transform_only(plan: Optional[TransformPlan] = None) -> TransformResult:
+    """Run the requested transform stages (default: all)."""
+
+    client = get_supabase_client()
+    if plan is None:
+        return run_full_transform(client)
+    return run_transform_with_plan(plan, client)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -453,6 +534,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--product-ids", type=str, help="Comma-separated product IDs to focus (overrides discovery)")
     parser.add_argument("--start-index", type=int, default=0, help="Start index when resuming reviews")
     parser.add_argument("--parent-category", type=int, default=DEFAULT_PARENT_CATEGORY_ID, help="Root category id to crawl")
+    parser.add_argument(
+        "--run-transform",
+        action="store_true",
+        help="Run the cleaned-schema transform after the selected extract stages",
+    )
+    parser.add_argument(
+        "--transform-stages",
+        nargs="+",
+        choices=sorted(TRANSFORM_STAGE_ALIASES.keys()),
+        help="If set, only run the specified transform stages (default is all)",
+    )
     return parser.parse_args()
 
 
@@ -496,6 +588,21 @@ def main() -> None:
         logger.warning("Review failures: %s", result.failed_review_ids)
     if result.failed_product_ids:
         logger.warning("Product enrichment failures: %s", result.failed_product_ids)
+
+    if getattr(args, "run_transform", False):
+        logger.info("Running cleaned transform as requested...")
+        transform_plan = _transform_plan_from_aliases(args.transform_stages or [])
+        transform_result = asyncio.run(run_transform_only(transform_plan))
+        logger.info(
+            "Transform completed: dim_category=%s, dim_seller=%s, dim_product=%s, ingredients=%s, review_clean=%s, review_daily=%s, review_summary=%s",
+            transform_result.dim_category_rows,
+            transform_result.dim_seller_rows,
+            transform_result.dim_product_rows,
+            transform_result.product_ingredient_rows,
+            transform_result.review_clean_rows,
+            transform_result.review_daily_rows,
+            transform_result.review_summary_rows,
+        )
 
 
 if __name__ == "__main__":

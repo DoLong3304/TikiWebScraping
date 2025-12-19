@@ -62,19 +62,22 @@ class GuiApp:
 
         self.connection_tab = ttk.Frame(notebook)
         self.settings_tab = ttk.Frame(notebook)
-        self.run_tab = ttk.Frame(notebook)
+        self.run_extract_tab = ttk.Frame(notebook)
+        self.run_transform_tab = ttk.Frame(notebook)
         self.stats_tab = ttk.Frame(notebook)
         self.sql_tab = ttk.Frame(notebook)
 
         notebook.add(self.connection_tab, text="Connections")
         notebook.add(self.settings_tab, text="Settings")
-        notebook.add(self.run_tab, text="Run")
+        notebook.add(self.run_extract_tab, text="Extract")
+        notebook.add(self.run_transform_tab, text="Transform")
         notebook.add(self.stats_tab, text="Stats")
         notebook.add(self.sql_tab, text="SQL editor")
 
         self._build_connections_tab()
         self._build_settings_tab()
-        self._build_run_tab()
+        self._build_extract_tab()
+        self._build_transform_tab()
         self._build_stats_tab()
         self._build_sql_tab()
 
@@ -162,14 +165,14 @@ class GuiApp:
         self._update_run_summary()
 
     # ------------------------------------------------------------------
-    # Run tab
+    # Extract tab
     # ------------------------------------------------------------------
-    def _build_run_tab(self) -> None:
-        frame = self.run_tab
+    def _build_extract_tab(self) -> None:
+        frame = self.run_extract_tab
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(3, weight=1)
 
-        controls = ttk.LabelFrame(frame, text="Run plan")
+        controls = ttk.LabelFrame(frame, text="Extract plan")
         controls.grid(row=0, column=0, sticky="ew", padx=4, pady=4)
         self.stage_options = [
             ("1. Categories + Listings", "categories_listings"),
@@ -194,13 +197,13 @@ class GuiApp:
         ttk.Entry(controls, textvariable=self.var_product_override, width=50).grid(row=4, column=1, sticky="w", padx=4, pady=2)
 
         # Run/Stop/Retry controls
-        self.btn_run = ttk.Button(controls, text="Run selected", command=self._on_run_selected)
+        self.btn_run = ttk.Button(controls, text="Run extract", command=self._on_run_extract)
         self.btn_run.grid(row=5, column=0, padx=4, pady=6, sticky="w")
         self.btn_stop = ttk.Button(controls, text="Stop", command=self._on_stop_clicked, state="disabled")
-        self.btn_stop.grid(row=5, column=1, padx=4, pady=6, sticky="w")
+        self.btn_stop.grid(row=5, column=3, padx=4, pady=6, sticky="w")
         self.btn_retry = ttk.Button(controls, text="Retry failed reviews", command=self._on_retry_failed)
-        self.btn_retry.grid(row=5, column=2, padx=4, pady=6, sticky="w")
-        ttk.Button(controls, text="Clear logs", command=self._clear_logs).grid(row=5, column=3, padx=4, pady=6, sticky="w")
+        self.btn_retry.grid(row=5, column=4, padx=4, pady=6, sticky="w")
+        ttk.Button(controls, text="Clear logs", command=self._clear_logs).grid(row=5, column=5, padx=4, pady=6, sticky="w")
 
         self.stage_listbox.bind("<<ListboxSelect>>", lambda _: self._update_run_summary())
         self.var_mode.trace_add("write", lambda *_: self._update_run_summary())
@@ -228,16 +231,7 @@ class GuiApp:
         self._update_run_summary()
 
         # Log panel
-        log_frame = ttk.LabelFrame(frame, text="Interactive logs")
-        log_frame.grid(row=3, column=0, sticky="nsew", padx=4, pady=4)
-        log_frame.columnconfigure(0, weight=1)
-        log_frame.rowconfigure(0, weight=1)
-
-        self.log_text = tk.Text(log_frame, wrap="word", state="disabled", height=25)
-        self.log_text.grid(row=0, column=0, sticky="nsew")
-        scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
-        scrollbar.grid(row=0, column=1, sticky="ns")
-        self.log_text["yscrollcommand"] = scrollbar.set
+        self._build_log_panel(frame)
 
     def _plan_from_form(self) -> RunPlan:
         product_ids: List[int] = []
@@ -295,7 +289,7 @@ class GuiApp:
         )
         self.var_run_summary.set(summary)
 
-    def _on_run_selected(self) -> None:
+    def _on_run_extract(self) -> None:
         plan = self._plan_from_form()
         if plan is None:
             return
@@ -303,6 +297,7 @@ class GuiApp:
         self.btn_run.configure(state="disabled")
         self.btn_retry.configure(state="disabled")
         self.btn_stop.configure(state="normal")
+        self._clear_logs()
         self._run_in_thread(lambda: self._execute_plan(plan))
 
     def _on_stop_clicked(self) -> None:
@@ -317,6 +312,8 @@ class GuiApp:
         self.btn_run.configure(state="normal")
         self.btn_retry.configure(state="normal")
         self.btn_stop.configure(state="disabled")
+        self.btn_transform_run.configure(state="normal")
+        self.btn_transform_stop.configure(state="disabled")
 
     def _execute_plan(self, plan: RunPlan) -> None:
         logging.info("Starting run: %s", plan)
@@ -333,6 +330,8 @@ class GuiApp:
                 self.btn_run.configure(state="normal")
                 self.btn_retry.configure(state="normal")
                 self.btn_stop.configure(state="disabled")
+                self.btn_transform_run.configure(state="normal")
+                self.btn_transform_stop.configure(state="disabled")
 
             self.root.after(0, _reset_buttons)
 
@@ -341,6 +340,111 @@ class GuiApp:
             messagebox.showinfo("Retry", "No failed review product IDs recorded yet.")
             return
         self._run_in_thread(self.runner.retry_failed_reviews)
+
+    # ------------------------------------------------------------------
+    # Transform tab
+    # ------------------------------------------------------------------
+    def _build_transform_tab(self) -> None:
+        frame = self.run_transform_tab
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(2, weight=1)
+
+        controls = ttk.LabelFrame(frame, text="Transform stages")
+        controls.grid(row=0, column=0, sticky="ew", padx=4, pady=4)
+
+        self.var_transform_dim_category = tk.BooleanVar(value=True)
+        self.var_transform_dim_seller = tk.BooleanVar(value=True)
+        self.var_transform_dim_product = tk.BooleanVar(value=True)
+        self.var_transform_product_ingredients = tk.BooleanVar(value=True)
+        self.var_transform_review_clean = tk.BooleanVar(value=True)
+        self.var_transform_review_daily = tk.BooleanVar(value=True)
+        self.var_transform_review_summary = tk.BooleanVar(value=True)
+
+        ttk.Checkbutton(controls, text="Dim Category", variable=self.var_transform_dim_category).grid(row=0, column=0, sticky="w", padx=4, pady=2)
+        ttk.Checkbutton(controls, text="Dim Seller", variable=self.var_transform_dim_seller).grid(row=0, column=1, sticky="w", padx=4, pady=2)
+        ttk.Checkbutton(controls, text="Dim Product", variable=self.var_transform_dim_product).grid(row=0, column=2, sticky="w", padx=4, pady=2)
+        ttk.Checkbutton(controls, text="Product Ingredients", variable=self.var_transform_product_ingredients).grid(row=1, column=0, sticky="w", padx=4, pady=2)
+        ttk.Checkbutton(controls, text="Review Clean", variable=self.var_transform_review_clean).grid(row=1, column=1, sticky="w", padx=4, pady=2)
+        ttk.Checkbutton(controls, text="Review Daily Agg", variable=self.var_transform_review_daily).grid(row=1, column=2, sticky="w", padx=4, pady=2)
+        ttk.Checkbutton(controls, text="Review Summary", variable=self.var_transform_review_summary).grid(row=1, column=3, sticky="w", padx=4, pady=2)
+
+        self.btn_transform_run = ttk.Button(controls, text="Run transform", command=self._on_run_transform)
+        self.btn_transform_run.grid(row=2, column=0, sticky="w", padx=4, pady=6)
+        self.btn_transform_stop = ttk.Button(controls, text="Stop", command=self._on_stop_clicked, state="disabled")
+        self.btn_transform_stop.grid(row=2, column=1, sticky="w", padx=4, pady=6)
+
+        tips = ttk.LabelFrame(frame, text="Transform summary")
+        tips.grid(row=1, column=0, sticky="ew", padx=4, pady=4)
+        tips.columnconfigure(0, weight=1)
+        self.var_transform_summary = tk.StringVar(value="All transform stages selected.")
+        ttk.Label(
+            tips,
+            textvariable=self.var_transform_summary,
+            foreground="#005a9c",
+            wraplength=950,
+            justify=tk.LEFT,
+        ).grid(row=0, column=0, sticky="w", padx=6, pady=6)
+
+        self._build_log_panel(frame, row=2)
+
+    def _on_run_transform(self) -> None:
+        plan = self.runner.build_transform_plan(
+            dim_category=self.var_transform_dim_category.get(),
+            dim_seller=self.var_transform_dim_seller.get(),
+            dim_product=self.var_transform_dim_product.get(),
+            product_ingredients=self.var_transform_product_ingredients.get(),
+            review_clean=self.var_transform_review_clean.get(),
+            review_daily=self.var_transform_review_daily.get(),
+            review_summary=self.var_transform_review_summary.get(),
+        )
+
+        enabled = [
+            name
+            for name, flag in [
+                ("Category", plan.dim_category),
+                ("Seller", plan.dim_seller),
+                ("Product", plan.dim_product),
+                ("Ingredients", plan.product_ingredients),
+                ("Review clean", plan.review_clean),
+                ("Review daily", plan.review_daily),
+                ("Review summary", plan.review_summary),
+            ]
+            if flag
+        ]
+        self.var_transform_summary.set(
+            "Selected stages: " + (", ".join(enabled) if enabled else "None (nothing to run)")
+        )
+        if not enabled:
+            messagebox.showinfo("Transform", "Select at least one transform stage to run.")
+            return
+
+        def _work() -> None:
+            summary = self.runner.run_transform(plan)
+            logging.info(
+                "Transform complete: dim_category=%s, dim_seller=%s, dim_product=%s, product_ingredients=%s, review_clean=%s, review_daily=%s, review_summary=%s",
+                summary.get("dim_category_rows", 0),
+                summary.get("dim_seller_rows", 0),
+                summary.get("dim_product_rows", 0),
+                summary.get("product_ingredient_rows", 0),
+                summary.get("review_clean_rows", 0),
+                summary.get("review_daily_rows", 0),
+                summary.get("review_summary_rows", 0),
+            )
+
+        self.btn_transform_run.configure(state="disabled")
+        self.btn_transform_stop.configure(state="normal")
+        self._clear_logs()
+        self._run_in_thread(lambda: self._execute_transform(_work))
+
+    def _execute_transform(self, work_func) -> None:
+        try:
+            work_func()
+        finally:
+            def _reset() -> None:
+                self.btn_transform_run.configure(state="normal")
+                self.btn_transform_stop.configure(state="disabled")
+
+            self.root.after(0, _reset)
 
     # ------------------------------------------------------------------
     # Stats tab
@@ -438,6 +542,18 @@ class GuiApp:
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", tk.END)
         self.log_text.configure(state="disabled")
+
+    def _build_log_panel(self, parent: tk.Widget, row: int = 3) -> None:
+        log_frame = ttk.LabelFrame(parent, text="Interactive logs")
+        log_frame.grid(row=row, column=0, sticky="nsew", padx=4, pady=4)
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(0, weight=1)
+
+        self.log_text = tk.Text(log_frame, wrap="word", state="disabled", height=25)
+        self.log_text.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.log_text["yscrollcommand"] = scrollbar.set
 
     # ------------------------------------------------------------------
     # Thread helpers

@@ -160,3 +160,45 @@ pytest -q
 - The default parent category remains the historic milk category for backward compatibility; override it per run for other domains.
 - Supabase client is cached per process to reduce overhead.
 - Network calls are best-effort; errors are logged and summarized per stage so runs can continue.
+
+---
+
+## Cleaned schema transform
+
+The project includes a post-scrape transform step that normalizes raw data in the `public` schema into an analysis-ready `cleaned` schema.
+
+Key components:
+
+- `cleaned_schema.sql` – SQL DDL for the `cleaned` schema (dimensions, facts, review tables, feature table).
+- `src/pipeline/transform.py` – orchestrates the transform:
+  - `sync_dim_category` – `public.category` → `cleaned.dim_category`.
+  - `sync_dim_seller` – `public.seller` → `cleaned.dim_seller`.
+  - `sync_dim_product` – `public.product` → `cleaned.dim_product` (including spec-derived fields like `capacity_raw`, `suitable_age_raw`, `is_organic`, etc.).
+  - `sync_product_ingredients` – extracts `thanh_phan` (ingredients) from `public.product.specifications` into `cleaned.product_ingredients`.
+- `src/pipeline/extract.py` – higher-level extract helpers that pull data from Tiki APIs into the raw `public` tables (`category`, `product`, `seller`, `review`) using the same logic as the orchestrator, but with a simpler synchronous API.
+
+The transform code is read-only with respect to the crawling pipeline: it only reads from `public` tables and writes into `cleaned`.
+
+### Running the transform
+
+After running a crawl (either via CLI, GUI, or `extract_all`), you can populate the cleaned schema from Python:
+
+```python
+from src.pipeline.transform import run_full_transform
+
+result = run_full_transform()  # uses the default Supabase client
+print(result)
+# TransformResult(dim_category_rows=..., dim_seller_rows=..., dim_product_rows=..., product_ingredient_rows=...)
+```
+
+Or, if you prefer an async entrypoint, you can use the helper in `src/pipeline/orchestrator.py`:
+
+```python
+import asyncio
+from src.pipeline.orchestrator import run_transform_only
+
+result = asyncio.run(run_transform_only())
+print(result)
+```
+
+Both approaches leave the existing crawling code untouched and simply normalize whatever data already exists in `public` into the `cleaned` schema. Missing or malformed JSON fields are mapped to `NULL` so you can gradually improve coverage over time.
