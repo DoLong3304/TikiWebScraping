@@ -36,6 +36,8 @@ class TransformResult:
     dim_seller_rows: int = 0
     dim_product_rows: int = 0
     product_ingredient_rows: int = 0
+    fact_product_daily_rows: int = 0
+    fact_seller_daily_rows: int = 0
     review_clean_rows: int = 0
     review_daily_rows: int = 0
     review_summary_rows: int = 0
@@ -49,6 +51,8 @@ class TransformPlan:
     dim_seller: bool = True
     dim_product: bool = True
     product_ingredients: bool = True
+    fact_product_daily: bool = True
+    fact_seller_daily: bool = True
     review_clean: bool = True
     review_daily: bool = True
     review_summary: bool = True
@@ -558,6 +562,146 @@ def sync_product_ingredients(client: Optional[Client] = None) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Daily fact snapshots (single-run friendly)
+# ---------------------------------------------------------------------------
+
+
+def sync_fact_product_daily(snapshot_date: Optional[date] = None, client: Optional[Client] = None) -> int:
+    """Snapshot product metrics into ``cleaned.fact_product_daily``.
+
+    Designed for ad-hoc runs (no scheduler); captures the current state of
+    ``public.product`` with a single ``date_sk`` and ``snapshot_at`` timestamp.
+    """
+
+    client = client or get_supabase_client()
+    rows = _get_public_rows(client, "product")
+    if not rows:
+        return 0
+
+    dim_res = _cleaned_table(client, "dim_product").select("product_id, product_sk, category_sk, seller_sk").execute()
+    dim_map = {row["product_id"]: row for row in (dim_res.data or [])}
+
+    snapshot = snapshot_date or datetime.now(timezone.utc).date()
+    _ensure_dim_date(client, [snapshot])
+    date_sk = _date_sk(snapshot)
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    inserts: List[Dict[str, Any]] = []
+    for r in rows:
+        pid = r.get("id")
+        dim_row = dim_map.get(pid)
+        if not dim_row:
+            continue
+        category_sk = dim_row.get("category_sk")
+        if category_sk is None:
+            continue
+        product_sk = dim_row.get("product_sk")
+        seller_sk = dim_row.get("seller_sk")
+
+        price = r.get("price")
+        list_price = r.get("list_price")
+        price_vs_list_percent = None
+        if list_price not in (None, 0):
+            try:
+                base = float(list_price)
+                if price is not None:
+                    price_vs_list_percent = round(((base - float(price)) / base) * 100, 2)
+            except (TypeError, ValueError):
+                price_vs_list_percent = None
+
+        product_daily_sk = product_sk * 100000 + date_sk
+
+        inserts.append(
+            {
+                "product_daily_sk": product_daily_sk,
+                "product_sk": product_sk,
+                "date_sk": date_sk,
+                "category_sk": category_sk,
+                "seller_sk": seller_sk,
+                "price": price,
+                "list_price": list_price,
+                "original_price": r.get("original_price"),
+                "discount": r.get("discount"),
+                "discount_rate": r.get("discount_rate"),
+                "rating_average": r.get("rating_average"),
+                "review_count_cumulative": r.get("review_count"),
+                "all_time_quantity_sold_cumulative": r.get("all_time_quantity_sold"),
+                "price_vs_list_percent": price_vs_list_percent,
+                "snapshot_at": now_iso,
+            }
+        )
+
+    if not inserts:
+        return 0
+
+    _cleaned_table(client, "fact_product_daily").upsert(
+        inserts,
+        on_conflict="product_sk,date_sk",
+    ).execute()
+    return len(inserts)
+
+
+def sync_fact_seller_daily(snapshot_date: Optional[date] = None, client: Optional[Client] = None) -> int:
+    """Snapshot seller metrics into ``cleaned.fact_seller_daily``.
+
+    Like ``sync_fact_product_daily``, this is intended for single-run usage and
+    records one row per seller for the chosen snapshot date.
+    """
+
+    client = client or get_supabase_client()
+    rows = _get_public_rows(client, "seller")
+    if not rows:
+        return 0
+
+    dim_res = _cleaned_table(client, "dim_seller").select("seller_id, seller_sk").execute()
+    seller_map = {row["seller_id"]: row["seller_sk"] for row in (dim_res.data or [])}
+
+    snapshot = snapshot_date or datetime.now(timezone.utc).date()
+    _ensure_dim_date(client, [snapshot])
+    date_sk = _date_sk(snapshot)
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    inserts: List[Dict[str, Any]] = []
+    for r in rows:
+        sid = r.get("id")
+        seller_sk = seller_map.get(sid)
+        if seller_sk is None:
+            continue
+
+        days_since_joined = r.get("days_since_joined")
+        try:
+            days_active = int(days_since_joined) if days_since_joined is not None else None
+        except (TypeError, ValueError):
+            days_active = None
+
+        seller_daily_sk = seller_sk * 100000 + date_sk
+
+        inserts.append(
+            {
+                "seller_daily_sk": seller_daily_sk,
+                "seller_sk": seller_sk,
+                "date_sk": date_sk,
+                "rating": r.get("rating"),
+                "avg_rating_point": r.get("avg_rating_point"),
+                "review_count_cumulative": r.get("review_count"),
+                "total_follower_cumulative": r.get("total_follower"),
+                "days_since_joined": days_since_joined,
+                "days_active": days_active,
+                "snapshot_at": now_iso,
+            }
+        )
+
+    if not inserts:
+        return 0
+
+    _cleaned_table(client, "fact_seller_daily").upsert(
+        inserts,
+        on_conflict="seller_sk,date_sk",
+    ).execute()
+    return len(inserts)
+
+
+# ---------------------------------------------------------------------------
 # Reviews
 # ---------------------------------------------------------------------------
 
@@ -919,6 +1063,10 @@ def run_transform_with_plan(plan: TransformPlan, client: Optional[Client] = None
         result.dim_product_rows = sync_dim_product(client)
     if plan.product_ingredients:
         result.product_ingredient_rows = sync_product_ingredients(client)
+    if plan.fact_product_daily:
+        result.fact_product_daily_rows = sync_fact_product_daily(client=client)
+    if plan.fact_seller_daily:
+        result.fact_seller_daily_rows = sync_fact_seller_daily(client=client)
     if plan.review_clean:
         result.review_clean_rows = sync_review_clean(client)
     if plan.review_daily:

@@ -356,6 +356,8 @@ class GuiApp:
         self.var_transform_dim_seller = tk.BooleanVar(value=True)
         self.var_transform_dim_product = tk.BooleanVar(value=True)
         self.var_transform_product_ingredients = tk.BooleanVar(value=True)
+        self.var_transform_fact_product_daily = tk.BooleanVar(value=True)
+        self.var_transform_fact_seller_daily = tk.BooleanVar(value=True)
         self.var_transform_review_clean = tk.BooleanVar(value=True)
         self.var_transform_review_daily = tk.BooleanVar(value=True)
         self.var_transform_review_summary = tk.BooleanVar(value=True)
@@ -364,14 +366,16 @@ class GuiApp:
         ttk.Checkbutton(controls, text="Dim Seller", variable=self.var_transform_dim_seller).grid(row=0, column=1, sticky="w", padx=4, pady=2)
         ttk.Checkbutton(controls, text="Dim Product", variable=self.var_transform_dim_product).grid(row=0, column=2, sticky="w", padx=4, pady=2)
         ttk.Checkbutton(controls, text="Product Ingredients", variable=self.var_transform_product_ingredients).grid(row=1, column=0, sticky="w", padx=4, pady=2)
-        ttk.Checkbutton(controls, text="Review Clean", variable=self.var_transform_review_clean).grid(row=1, column=1, sticky="w", padx=4, pady=2)
-        ttk.Checkbutton(controls, text="Review Daily Agg", variable=self.var_transform_review_daily).grid(row=1, column=2, sticky="w", padx=4, pady=2)
-        ttk.Checkbutton(controls, text="Review Summary", variable=self.var_transform_review_summary).grid(row=1, column=3, sticky="w", padx=4, pady=2)
+        ttk.Checkbutton(controls, text="Product Daily Fact", variable=self.var_transform_fact_product_daily).grid(row=1, column=1, sticky="w", padx=4, pady=2)
+        ttk.Checkbutton(controls, text="Seller Daily Fact", variable=self.var_transform_fact_seller_daily).grid(row=1, column=2, sticky="w", padx=4, pady=2)
+        ttk.Checkbutton(controls, text="Review Clean", variable=self.var_transform_review_clean).grid(row=2, column=0, sticky="w", padx=4, pady=2)
+        ttk.Checkbutton(controls, text="Review Daily Agg", variable=self.var_transform_review_daily).grid(row=2, column=1, sticky="w", padx=4, pady=2)
+        ttk.Checkbutton(controls, text="Review Summary", variable=self.var_transform_review_summary).grid(row=2, column=2, sticky="w", padx=4, pady=2)
 
         self.btn_transform_run = ttk.Button(controls, text="Run transform", command=self._on_run_transform)
-        self.btn_transform_run.grid(row=2, column=0, sticky="w", padx=4, pady=6)
+        self.btn_transform_run.grid(row=3, column=0, sticky="w", padx=4, pady=6)
         self.btn_transform_stop = ttk.Button(controls, text="Stop", command=self._on_stop_clicked, state="disabled")
-        self.btn_transform_stop.grid(row=2, column=1, sticky="w", padx=4, pady=6)
+        self.btn_transform_stop.grid(row=3, column=1, sticky="w", padx=4, pady=6)
 
         tips = ttk.LabelFrame(frame, text="Transform summary")
         tips.grid(row=1, column=0, sticky="ew", padx=4, pady=4)
@@ -393,6 +397,8 @@ class GuiApp:
             dim_seller=self.var_transform_dim_seller.get(),
             dim_product=self.var_transform_dim_product.get(),
             product_ingredients=self.var_transform_product_ingredients.get(),
+            fact_product_daily=self.var_transform_fact_product_daily.get(),
+            fact_seller_daily=self.var_transform_fact_seller_daily.get(),
             review_clean=self.var_transform_review_clean.get(),
             review_daily=self.var_transform_review_daily.get(),
             review_summary=self.var_transform_review_summary.get(),
@@ -405,6 +411,8 @@ class GuiApp:
                 ("Seller", plan.dim_seller),
                 ("Product", plan.dim_product),
                 ("Ingredients", plan.product_ingredients),
+                ("Product daily", plan.fact_product_daily),
+                ("Seller daily", plan.fact_seller_daily),
                 ("Review clean", plan.review_clean),
                 ("Review daily", plan.review_daily),
                 ("Review summary", plan.review_summary),
@@ -421,11 +429,13 @@ class GuiApp:
         def _work() -> None:
             summary = self.runner.run_transform(plan)
             logging.info(
-                "Transform complete: dim_category=%s, dim_seller=%s, dim_product=%s, product_ingredients=%s, review_clean=%s, review_daily=%s, review_summary=%s",
+                "Transform complete: dim_category=%s, dim_seller=%s, dim_product=%s, product_ingredients=%s, product_daily=%s, seller_daily=%s, review_clean=%s, review_daily=%s, review_summary=%s",
                 summary.get("dim_category_rows", 0),
                 summary.get("dim_seller_rows", 0),
                 summary.get("dim_product_rows", 0),
                 summary.get("product_ingredient_rows", 0),
+                summary.get("fact_product_daily_rows", 0),
+                summary.get("fact_seller_daily_rows", 0),
                 summary.get("review_clean_rows", 0),
                 summary.get("review_daily_rows", 0),
                 summary.get("review_summary_rows", 0),

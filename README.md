@@ -175,6 +175,8 @@ Key components:
   - `sync_dim_seller` – `public.seller` → `cleaned.dim_seller`.
   - `sync_dim_product` – `public.product` → `cleaned.dim_product` (including spec-derived fields like `capacity_raw`, `suitable_age_raw`, `is_organic`, etc.).
   - `sync_product_ingredients` – extracts `thanh_phan` (ingredients) from `public.product.specifications` into `cleaned.product_ingredients`.
+  - `sync_fact_product_daily` – snapshots current product metrics from `public.product` into `cleaned.fact_product_daily` using a single snapshot date.
+  - `sync_fact_seller_daily` – snapshots current seller metrics from `public.seller` into `cleaned.fact_seller_daily` using a single snapshot date.
 - `src/pipeline/extract.py` – higher-level extract helpers that pull data from Tiki APIs into the raw `public` tables (`category`, `product`, `seller`, `review`) using the same logic as the orchestrator, but with a simpler synchronous API.
 
 The transform code is read-only with respect to the crawling pipeline: it only reads from `public` tables and writes into `cleaned`.
